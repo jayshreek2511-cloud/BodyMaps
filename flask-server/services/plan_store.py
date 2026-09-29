@@ -29,7 +29,7 @@ from sqlalchemy import select
 
 from models.engine import session_scope
 from models.job import utcnow
-from models.usage_event import KIND_AI_MESSAGE, KIND_INFERENCE, UsageEvent
+from models.usage_event import KIND_AI_MESSAGE, KIND_INFERENCE, KIND_INTERACTIVE_SESSION, UsageEvent
 from models.user import User
 from services import role_store
 
@@ -131,6 +131,13 @@ def _qualifies_as_verified(user) -> bool:
         and bool((user.occupation or "").strip())
         and bool((user.role_description or "").strip())
     )
+
+
+def is_verified_researcher(user_id: str) -> bool:
+    """Whether the account has completed the existing verified-researcher gate."""
+    with session_scope() as s:
+        user = s.get(User, user_id)
+        return _qualifies_as_verified(user)
 
 
 def limits_for_user(user_id: str) -> tuple[str, dict]:
@@ -354,6 +361,20 @@ def record_ai_message(user_id: str) -> None:
         ))
 
 
+def count_interactive_sessions(user_id: str) -> int:
+    with session_scope() as s:
+        return _count_in_window(s, user_id, KIND_INTERACTIVE_SESSION)
+
+
+def record_interactive_session(user_id: str, session_id: str) -> None:
+    with session_scope() as s:
+        s.add(UsageEvent(
+            id=str(uuid.uuid4()), user_id=user_id,
+            kind=KIND_INTERACTIVE_SESSION, ref_id=session_id,
+            finished_at=utcnow(),
+        ))
+
+
 # ---- reporting -------------------------------------------------------------
 
 def usage_summary(user_id: str) -> dict:
@@ -374,5 +395,10 @@ def usage_summary(user_id: str) -> dict:
                 "used": _count_in_window(s, user_id, KIND_AI_MESSAGE),
                 "limit": limits["daily_ai_messages"],
                 "resets_at": _resets_at(s, user_id, KIND_AI_MESSAGE),
+            },
+            "interactive_sessions": {
+                "used": _count_in_window(s, user_id, KIND_INTERACTIVE_SESSION),
+                "limit": None,
+                "resets_at": _resets_at(s, user_id, KIND_INTERACTIVE_SESSION),
             },
         }

@@ -20,6 +20,7 @@ from api.auth_blueprint import auth_blueprint
 from api.oauth_blueprint import init_oauth, oauth_blueprint
 from api.admin_blueprint import admin_blueprint
 from api.analytics_blueprint import analytics_blueprint
+from api.interactive import interactive_blueprint
 from models.base import db
 from models.combined_labels import CombinedLabels
 from models.engine import get_engine
@@ -73,6 +74,7 @@ def create_app():
     app.register_blueprint(oauth_blueprint, url_prefix=f'{Constants.BASE_PATH}/api')
     app.register_blueprint(admin_blueprint, url_prefix=f'{Constants.BASE_PATH}/api')
     app.register_blueprint(analytics_blueprint, url_prefix=f'{Constants.BASE_PATH}/api')
+    app.register_blueprint(interactive_blueprint, url_prefix=f'{Constants.BASE_PATH}/api')
 
     app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2 GB, for overcoming size limits in file uploads
 

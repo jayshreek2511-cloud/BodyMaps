@@ -21,6 +21,7 @@ from models.job import utcnow
 # Wire values; plan_store switches on them.
 KIND_INFERENCE = "inference"
 KIND_AI_MESSAGE = "ai_message"
+KIND_INTERACTIVE_SESSION = "interactive_session"
 
 
 class UsageEvent(db.Model):
