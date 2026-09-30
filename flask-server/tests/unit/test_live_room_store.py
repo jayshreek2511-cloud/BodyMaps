@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from services.live_room_store import (
     MEASUREMENT_TOOLS,
+    LiveRoomError,
     LiveRoomStore,
     RoomExpired,
     RoomNotFound,
@@ -126,6 +127,59 @@ def test_server_owns_chat_and_note_author_names(room_store):
     )
     assert chat["payload"]["message"]["author"] == "Reviewer"
     assert note["payload"]["note"]["author"] == "Reviewer"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Live Room store uses POSIX fsync/chmod semantics")
+def test_interactive_prompt_delta_is_persisted_as_export_provenance(room_store):
+    store, metadata, key = create(room_store)
+    event, replayed = store.commit_event(
+        metadata["room_id"], key, event_id="interactive-prompt:0", event_type="interactive.prompt",
+        participant_id="participant-1", name="Reviewer",
+        payload={
+            "prompt_id": "interactive-prompt", "prompt_type": "point",
+            "prompt": {"type": "point", "coordinates": [1, 1, 1]},
+            "slice_axis": 2, "slice_index": 1, "include": True,
+            "bbox": [[0, 2], [0, 2], [0, 1]], "shape": [2, 2, 1],
+            "encoding": "zlib-base64-uint8", "chunk_index": 0, "chunk_count": 1,
+            "data_chunk": "eA==", "label_id": 23, "organ_label": "Liver", "prompt_count": 2,
+        },
+    )
+    assert not replayed
+    assert event["payload"]["prompt"]["coordinates"] == [1, 1, 1]
+    assert event["payload"]["label_id"] == 23
+    assert event["payload"]["organ_label"] == "Liver"
+    assert event["payload"]["prompt_count"] == 2
+    accepted, _ = store.commit_event(
+        metadata["room_id"], key, event_id="interactive-accept:0", event_type="interactive.accept",
+        participant_id="participant-1", name="Reviewer",
+        payload={"accept_id": "interactive-accept", "bbox": [[0, 1], [0, 1], [0, 1]],
+                 "shape": [1, 1, 1], "chunk_index": 0, "chunk_count": 1, "data_chunk": "eA==",
+                 "label_id": 23, "organ_label": "Liver", "prompt_count": 2,
+                 "prompt_log": ["point (+)", "box (+)"], "allow_overwrite": False},
+    )
+    assert accepted["payload"]["prompt_log"] == ["point (+)", "box (+)"]
+    with zipfile.ZipFile(store.build_export(metadata["room_id"], key)) as archive:
+        saved = [json.loads(line) for line in archive.read("events.jsonl").decode().splitlines()]
+    assert saved[-2]["type"] == "interactive.prompt"
+    assert saved[-1]["type"] == "interactive.accept"
+    assert saved[-1]["payload"]["data_chunk"] == "eA=="
+
+
+def test_interactive_accept_event_sanitizes_organ_provenance_without_disk_io():
+    store = object.__new__(LiveRoomStore)
+    payload = {"accept_id": "accept-1", "bbox": [[0, 1], [0, 1], [0, 1]], "shape": [1, 1, 1],
+               "chunk_index": 0, "chunk_count": 1, "data_chunk": "eA==", "label_id": 23,
+               "organ_label": "Liver", "prompt_count": 2, "prompt_log": ["point (+)"],
+               "allow_overwrite": False}
+    normalized, before = store._apply_event(
+        Path("."), {"dimensions": [2, 2, 2]}, {}, "interactive.accept", payload, 1, "Reviewer"
+    )
+    assert before is None
+    assert normalized["organ_label"] == "Liver"
+    assert normalized["prompt_log"] == ["point (+)"]
+    with pytest.raises(LiveRoomError, match="accepted organ provenance"):
+        store._apply_event(Path("."), {"dimensions": [2, 2, 2]}, {}, "interactive.accept",
+                           {**payload, "label_id": True}, 2, "Reviewer")
 
 
 def test_current_metadata_does_not_rescan_complete_event_log(room_store, monkeypatch):

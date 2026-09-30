@@ -95,6 +95,8 @@ DURABLE_TYPES = {
     "note.upsert",
     "note.delete",
     "chat.add",
+    "interactive.prompt",
+    "interactive.accept",
 }
 QUIZ_EVENT_TYPES = {
     "quiz.started",
@@ -1976,6 +1978,146 @@ class LiveRoomStore:
             payload = {"message": message}
         elif event_type == "mask.patch":
             payload = self._validate_mask_patch(room_dir, payload, metadata)
+        elif event_type == "interactive.accept":
+            accept_id = str(payload.get("accept_id", ""))
+            chunk_index, chunk_count = payload.get("chunk_index"), payload.get("chunk_count")
+            data_chunk = payload.get("data_chunk", "")
+            bbox, shape = payload.get("bbox"), payload.get("shape")
+            dimensions = metadata.get("dimensions") or []
+            if (not accept_id or len(accept_id) > 128
+                    or not isinstance(chunk_index, int) or isinstance(chunk_index, bool)
+                    or not isinstance(chunk_count, int) or isinstance(chunk_count, bool)
+                    or chunk_count < 1 or chunk_count > 4096 or chunk_index < 0 or chunk_index >= chunk_count
+                    or not isinstance(data_chunk, str) or len(data_chunk) > 360_000
+                    or not re.fullmatch(r"[A-Za-z0-9+/=]*", data_chunk)
+                    or not isinstance(bbox, list) or len(bbox) != 3
+                    or not isinstance(shape, list) or len(shape) != 3):
+                raise LiveRoomError("Invalid interactive accept event")
+            normalized_bbox, normalized_shape = [], []
+            for axis, pair in enumerate(bbox):
+                if (not isinstance(pair, list) or len(pair) != 2
+                        or not isinstance(pair[0], int) or isinstance(pair[0], bool)
+                        or not isinstance(pair[1], int) or isinstance(pair[1], bool)
+                        or pair[0] < 0 or pair[1] <= pair[0] or axis >= len(dimensions)
+                        or pair[1] > int(dimensions[axis])
+                        or not isinstance(shape[axis], int) or isinstance(shape[axis], bool)
+                        or shape[axis] != pair[1] - pair[0]):
+                    raise LiveRoomError("Invalid interactive accept geometry")
+                normalized_bbox.append(pair)
+                normalized_shape.append(shape[axis])
+            label_id = payload.get("label_id")
+            organ_label = payload.get("organ_label", "")
+            prompt_count = payload.get("prompt_count", 0)
+            prompt_log = payload.get("prompt_log", [])
+            if (not isinstance(label_id, int) or isinstance(label_id, bool) or not 1 <= label_id <= 65535
+                    or not isinstance(organ_label, str) or len(organ_label) > 128
+                    or not isinstance(prompt_count, int) or isinstance(prompt_count, bool) or prompt_count < 0
+                    or not isinstance(prompt_log, list) or len(prompt_log) > 10000
+                    or any(not isinstance(entry, str) or len(entry) > 128 for entry in prompt_log)
+                    or not isinstance(payload.get("allow_overwrite", False), bool)):
+                raise LiveRoomError("Invalid accepted organ provenance")
+            payload = {"accept_id": accept_id, "bbox": normalized_bbox, "shape": normalized_shape,
+                       "encoding": "zlib-base64-uint8", "chunk_index": chunk_index,
+                       "chunk_count": chunk_count, "data_chunk": data_chunk, "label_id": label_id,
+                       "organ_label": organ_label, "prompt_count": prompt_count,
+                       "prompt_log": prompt_log if chunk_index == 0 else [],
+                       "allow_overwrite": payload.get("allow_overwrite", False)}
+        elif event_type == "interactive.prompt":
+            prompt_id = str(payload.get("prompt_id", ""))
+            prompt_type = str(payload.get("prompt_type", ""))
+            if not prompt_id or len(prompt_id) > 128 or prompt_type not in {"point", "bbox", "scribble", "lasso"}:
+                raise LiveRoomError("Invalid interactive prompt provenance")
+            chunk_index, chunk_count = payload.get("chunk_index"), payload.get("chunk_count")
+            data_chunk = payload.get("data_chunk", "")
+            if (not isinstance(chunk_index, int) or not isinstance(chunk_count, int)
+                    or chunk_count < 1 or chunk_count > 4096 or chunk_index < 0 or chunk_index >= chunk_count):
+                raise LiveRoomError("Invalid interactive delta chunk sequence")
+            if not isinstance(data_chunk, str) or len(data_chunk) > 360_000 or not re.fullmatch(r"[A-Za-z0-9+/=]*", data_chunk):
+                raise LiveRoomError("Invalid interactive delta chunk")
+            bbox = payload.get("bbox")
+            shape = payload.get("shape")
+            dimensions = metadata.get("dimensions") or []
+            if (not isinstance(bbox, list) or len(bbox) != 3 or not isinstance(shape, list) or len(shape) != 3
+                    or any(not isinstance(pair, list) or len(pair) != 2 for pair in bbox)):
+                raise LiveRoomError("Invalid interactive delta geometry")
+            normalized_bbox = []
+            normalized_shape = []
+            for axis, pair in enumerate(bbox):
+                start, end = pair
+                if (not isinstance(start, int) or not isinstance(end, int) or start < 0
+                        or end <= start or axis >= len(dimensions) or end > int(dimensions[axis])):
+                    raise LiveRoomError("Interactive delta is outside the room volume")
+                size = end - start
+                if not isinstance(shape[axis], int) or shape[axis] != size:
+                    raise LiveRoomError("Interactive delta shape does not match its bounds")
+                normalized_bbox.append([start, end])
+                normalized_shape.append(size)
+            raw_prompt = payload.get("prompt")
+            if chunk_index == 0 and (not isinstance(raw_prompt, dict) or raw_prompt.get("type") != prompt_type):
+                raise LiveRoomError("The first interactive delta chunk requires its prompt")
+            prompt = None
+            if chunk_index == 0:
+                prompt = {"type": prompt_type}
+                if prompt_type == "point":
+                    coords = raw_prompt.get("coordinates")
+                    if (not isinstance(coords, list) or len(coords) != 3
+                            or any(not isinstance(value, int) or value < 0 or value >= int(dimensions[i])
+                                   for i, value in enumerate(coords))):
+                        raise LiveRoomError("Invalid interactive point provenance")
+                    prompt["coordinates"] = coords
+                elif prompt_type == "bbox":
+                    bounds = raw_prompt.get("bounds")
+                    if not isinstance(bounds, list) or len(bounds) != 3:
+                        raise LiveRoomError("Invalid interactive box provenance")
+                    prompt["bounds"] = bounds
+                else:
+                    raw_bbox = raw_prompt.get("interaction_bbox")
+                    points = raw_prompt.get("points")
+                    if (not isinstance(raw_bbox, list) or len(raw_bbox) != 3
+                            or any(not isinstance(pair, list) or len(pair) != 2
+                                   or not isinstance(pair[0], int) or not isinstance(pair[1], int)
+                                   or pair[0] < 0 or pair[1] <= pair[0] or pair[1] > int(dimensions[axis])
+                                   for axis, pair in enumerate(raw_bbox))
+                            or sum(pair[1] - pair[0] == 1 for pair in raw_bbox) != 1
+                            or not isinstance(points, list) or not 1 <= len(points) <= 5000
+                            or any(not isinstance(point, list) or len(point) != 3
+                                   or any(not isinstance(value, int) or value < 0 or value >= int(dimensions[axis])
+                                          for axis, value in enumerate(point))
+                                   for point in points)):
+                        raise LiveRoomError("Invalid interactive stroke provenance")
+                    prompt["interaction_bbox"] = raw_bbox
+                    prompt["points"] = points
+            slice_axis = payload.get("slice_axis", 0)
+            slice_index = payload.get("slice_index", 0)
+            include = payload.get("include", True)
+            if (not isinstance(slice_axis, int) or slice_axis not in (0, 1, 2)
+                    or not isinstance(slice_index, int) or slice_index < 0 or slice_index >= int(dimensions[slice_axis])
+                    or not isinstance(include, bool)):
+                raise LiveRoomError("Invalid interactive slice prompt")
+            label_id = payload.get("label_id")
+            organ_label = payload.get("organ_label", "")
+            prompt_count = payload.get("prompt_count", 0)
+            if (label_id is not None and (not isinstance(label_id, int) or isinstance(label_id, bool) or not 1 <= label_id <= 65535)
+                    or not isinstance(organ_label, str) or len(organ_label) > 128
+                    or not isinstance(prompt_count, int) or isinstance(prompt_count, bool) or prompt_count < 0):
+                raise LiveRoomError("Invalid interactive organ provenance")
+            payload = {
+                "prompt_id": prompt_id,
+                "prompt_type": prompt_type,
+                "prompt": prompt if chunk_index == 0 else None,
+                "slice_axis": slice_axis,
+                "slice_index": slice_index,
+                "include": include,
+                "bbox": normalized_bbox,
+                "shape": normalized_shape,
+                "encoding": "zlib-base64-uint8",
+                "chunk_index": chunk_index,
+                "chunk_count": chunk_count,
+                "data_chunk": data_chunk,
+                "label_id": label_id,
+                "organ_label": organ_label,
+                "prompt_count": prompt_count,
+            }
         else:
             raise LiveRoomError("Unsupported durable event type")
         return payload, before

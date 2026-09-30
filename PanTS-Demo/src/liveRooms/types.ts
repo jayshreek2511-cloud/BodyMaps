@@ -119,7 +119,7 @@ export type LiveRoomMaskPatch = {
 export type LiveRoomEvent = {
 	seq: number;
 	event_id: string;
-	type: "measurement.upsert" | "measurement.delete" | "mask.patch" | "note.upsert" | "note.delete" | "chat.add"
+	type: "measurement.upsert" | "measurement.delete" | "mask.patch" | "note.upsert" | "note.delete" | "chat.add" | "interactive.prompt" | "interactive.accept"
 		| "quiz.started" | "quiz.closed" | "quiz.revealed" | "quiz.advanced"
 		| "quiz.host_paused" | "quiz.host_resumed" | "quiz.host_promoted";
 	participant_id: string;
