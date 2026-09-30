@@ -47,3 +47,14 @@ def test_mock_replay_reconstructs_prompts():
     session.replay([prompt])
     assert session.target_buffer.sum() > 0
     assert len(session._prompts) == 1
+
+
+def test_mock_can_refine_a_seeded_organ_mask():
+    session = make_session((14, 14, 14))
+    target = session.target_buffer
+    target[4:10, 4:10, 4:10] = 1
+    session.add_initial_seg_interaction(target.copy(), run_prediction=False)
+    before = int(target.sum())
+    session.add_point_interaction([6, 6, 6], include_interaction=False)
+    assert int(target.sum()) < before
+    assert int(target.sum()) > 0

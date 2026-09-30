@@ -37,6 +37,11 @@ class FakeInteractiveSession:
             raise ValueError("target buffer must match the image [X, Y, Z] shape")
         self.target_buffer = target_buffer
 
+    def add_initial_seg_interaction(self, initial_seg: np.ndarray, run_prediction: bool = False, **_kwargs) -> None:
+        if self.target_buffer is None or tuple(initial_seg.shape) != tuple(self.target_buffer.shape):
+            raise ValueError("initial mask must match the image shape")
+        self.target_buffer[...] = np.asarray(initial_seg, dtype=np.uint8)
+
     def _snapshot(self) -> None:
         if self.target_buffer is None:
             raise RuntimeError("set image and target buffer before adding prompts")
@@ -144,4 +149,3 @@ class FakeInteractiveSession:
         self.target_buffer = None
         self._prompts.clear()
         self._undo = None
-

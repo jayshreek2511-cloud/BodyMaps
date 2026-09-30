@@ -97,6 +97,58 @@ def _volume_path(dataset: str, case_id: str) -> Path:
     return base
 
 
+def _label_path(dataset: str, case_id: str) -> Path:
+    volume = _volume_path(dataset, case_id)
+    root = Path(Constants.PANTS_PATH if dataset.lower() in {"pants", "pant-s", "pan_ts"} else Constants.CANCERVERSE_PATH).resolve()
+    path = (root / "mask_only" / volume.parent.name / "combined_labels.nii.gz").resolve()
+    if root not in path.parents:
+        raise InteractiveError("Invalid organ label path")
+    return path
+
+
+def _load_initial_mask(dataset: str, case_id: str, label_id: int, image_shape: tuple[int, ...]) -> np.ndarray:
+    if isinstance(label_id, bool) or not isinstance(label_id, int) or not 1 <= label_id <= 65535:
+        raise InteractiveError("initial_mask_label must be a label ID between 1 and 65535")
+    path = _label_path(dataset, case_id)
+    if not path.is_file():
+        return np.zeros(image_shape, dtype=np.uint8)
+    labels = nib.load(str(path), mmap=True)
+    if tuple(labels.shape) != image_shape:
+        raise InteractiveError("The existing organ mask does not match the original CT volume")
+    return np.ascontiguousarray(np.asanyarray(labels.dataobj) == label_id, dtype=np.uint8)
+
+
+def _room_context(room_id: str | None):
+    if not room_id:
+        return None
+    try:
+        from api.live_rooms import get_live_room_store
+        metadata = get_live_room_store().get_metadata(room_id, request.headers.get("X-Room-Key", ""))
+    except Exception as exc:
+        error = InteractiveError(str(exc) or "Live Room access was denied")
+        error.status_code = getattr(exc, "status_code", 401)
+        error.code = getattr(exc, "code", "invalid_room_key")
+        raise error from exc
+    if metadata.get("mode") == "quiz":
+        raise InteractiveError("Interactive segmentation is unavailable in quiz rooms")
+    return metadata
+
+
+def _same_case(case_a: str, case_b: str) -> bool:
+    def normalize(value: str) -> str:
+        text = str(value).strip().upper()
+        if text.startswith("PANTS_"):
+            return "PANTS_" + text[6:].lstrip("0")
+        if text.startswith("CV_"):
+            return "CV_" + text[3:].lstrip("0")
+        if text.startswith("CV") and text[2:].isdigit():
+            return "CV_" + text[2:].lstrip("0")
+        if text.isdigit():
+            return "PANTS_" + text.lstrip("0")
+        return text.lstrip("0")
+    return normalize(case_a) == normalize(case_b)
+
+
 def _load_original_ct(dataset: str, case_id: str) -> np.ndarray:
     path = _volume_path(dataset, case_id)
     image = nib.load(str(path), mmap=True)
@@ -120,7 +172,24 @@ def _session():
     session_id = body.get("session_id")
     if not isinstance(session_id, str) or len(session_id) > 64:
         raise InteractiveError("session_id is required")
-    return manager.get(session_id, str(user["id"])), user
+    room_id = body.get("room_id")
+    room = _room_context(str(room_id)) if room_id else None
+    item = manager.get(session_id, str(user["id"]), str(room_id) if room_id else None)
+    if room and not _same_case(str(room.get("case_id", "")), item.case_id):
+        raise InteractiveError("This interactive session belongs to a different room case")
+    if item.room_id and item.room_id != room_id:
+        raise InteractiveError("This interactive session must be used through its Live Room")
+    if item.room_id and str(user["id"]) not in item.charged_users:
+        with _quota_lock:
+            quota = max(0, int(os.environ.get("NNINTERACTIVE_DAILY_QUOTA", "5")))
+            if plan_store.count_interactive_sessions(str(user["id"])) >= quota:
+                error = InteractiveError("Daily interactive session limit reached")
+                error.status_code = 429
+                error.code = "daily_quota_exceeded"
+                raise error
+            plan_store.record_interactive_session(str(user["id"]), item.session_id)
+            item.charged_users.add(str(user["id"]))
+    return item, user
 
 
 @interactive_blueprint.errorhandler(InteractiveError)
@@ -152,18 +221,47 @@ def interactive_start():
     dataset, case_id = str(body.get("dataset", "PanTS")), str(body.get("case_id", ""))
     quota = max(0, int(os.environ.get("NNINTERACTIVE_DAILY_QUOTA", "5")))
     active_max = max(1, int(os.environ.get("NNINTERACTIVE_MAX_SESSIONS_PER_USER", "2")))
+    room_id = str(body.get("room_id", "")) or None
+    room = _room_context(room_id)
+    if room:
+        room_case_id = str(room.get("case_id", ""))
+        if case_id and not _same_case(case_id, room_case_id):
+            raise InteractiveError("Case ID does not match the Live Room")
+        case_id = room_case_id
+        dataset = "CancerVerse" if case_id.upper().startswith("CV") else "PanTS"
+        existing = manager.find_room(room_id)
+        if existing:
+            if not _same_case(existing.case_id, case_id):
+                raise InteractiveError("Live Room already has an interactive session for a different case")
+            if str(user["id"]) not in existing.charged_users:
+                with _quota_lock:
+                    if plan_store.count_interactive_sessions(str(user["id"])) >= quota:
+                        return jsonify({"error": "Daily interactive session limit reached", "code": "daily_quota_exceeded",
+                                        "limit": quota}), 429
+                    plan_store.record_interactive_session(str(user["id"]), existing.session_id)
+                    existing.charged_users.add(str(user["id"]))
+            return jsonify({"session_id": existing.session_id, "shape": list(existing.image.shape),
+                            "dtype": str(existing.image.dtype), "dataset": dataset, "case_id": case_id,
+                            "room_id": room_id, "label_id": existing.label_id,
+                            "seeded_mask": encode_region(existing.target, _mask_bbox(existing.target))}), 200
     with _quota_lock:
         if plan_store.count_interactive_sessions(str(user["id"])) >= quota:
             return jsonify({"error": "Daily interactive session limit reached", "code": "daily_quota_exceeded",
                             "limit": quota}), 429
+        manager.reap_idle()
         if manager.active_count(str(user["id"])) >= active_max:
             return jsonify({"error": "Too many active interactive sessions", "code": "active_session_limit",
                             "limit": active_max}), 429
         image = _load_original_ct(dataset, case_id)
-        item = manager.create(str(user["id"]), dataset, case_id, image)
+        initial_label = body.get("initial_mask_label")
+        seed = _load_initial_mask(dataset, case_id, initial_label, image.shape) if initial_label is not None else None
+        item = manager.create(str(user["id"]), dataset, case_id, image, room_id=room_id,
+                              initial_mask=seed, label_id=initial_label)
         plan_store.record_interactive_session(str(user["id"]), item.session_id)
     return jsonify({"session_id": item.session_id, "shape": list(item.image.shape),
-                    "dtype": str(item.image.dtype), "dataset": dataset, "case_id": case_id}), 201
+                    "dtype": str(item.image.dtype), "dataset": dataset, "case_id": case_id,
+                    "room_id": room_id,
+                    "seeded_mask": encode_region(item.target, _mask_bbox(item.target))}), 201
 
 
 def _do_prompt(kind: str):
@@ -245,7 +343,23 @@ def interactive_reset():
         return user
     with item.lock:
         manager.reset(item)
-    return jsonify({"reset": True}), 200
+        seeded = encode_region(item.target, _mask_bbox(item.target))
+    return jsonify({"reset": True, "seeded_mask": seeded}), 200
+
+
+@interactive_blueprint.post("/interactive/select-organ")
+def interactive_select_organ():
+    item, user = _session()
+    if item is None:
+        return user
+    label_id = _json_body().get("label_id")
+    if isinstance(label_id, bool) or not isinstance(label_id, int) or not 1 <= label_id <= 65535:
+        raise InteractiveError("label_id must be between 1 and 65535")
+    seed = _load_initial_mask(item.dataset, item.case_id, label_id, item.image.shape)
+    with item.lock:
+        manager.select_target(item, label_id, seed)
+        seeded = encode_region(item.target, _mask_bbox(item.target))
+    return jsonify({"label_id": label_id, "seeded_mask": seeded}), 200
 
 
 @interactive_blueprint.post("/interactive/commit")
@@ -260,11 +374,18 @@ def interactive_commit():
         raise InteractiveError("label_name is required and must be at most 128 characters")
     if isinstance(label_id, bool) or not isinstance(label_id, int) or label_id < 1 or label_id > 65535:
         raise InteractiveError("label_id must be an integer between 1 and 65535")
+    if item.label_id is not None and label_id != item.label_id:
+        raise InteractiveError("Accept the preview for the currently selected organ")
     with item.lock:
-        bbox = _mask_bbox(item.target)
+        # Include both the latest proposal and the starting/previously accepted
+        # mask. Zeroes in this union are meaningful: they remove own-label
+        # voxels when the user accepts a smaller refinement.
+        bbox = _mask_bbox(np.logical_or(item.target, item.seed_target))
         delta = encode_region(item.target, bbox)
     if delta is None:
         raise InteractiveError("There is no preview mask to accept")
+    with item.lock:
+        manager.accept(item)
     return jsonify({"accepted": True, "label_name": label_name.strip(), "label_id": label_id,
                     "bbox": bbox, "mask": delta}), 200
 
@@ -281,7 +402,7 @@ def interactive_close():
     item, user = _session()
     if item is None:
         return user
-    manager.close(item.session_id, str(user["id"]))
+    manager.close(item.session_id, str(user["id"]), item.room_id)
     return jsonify({"closed": True}), 200
 
 
@@ -306,4 +427,3 @@ def interactive_health():
                 remote.close()
             except Exception:
                 pass
-

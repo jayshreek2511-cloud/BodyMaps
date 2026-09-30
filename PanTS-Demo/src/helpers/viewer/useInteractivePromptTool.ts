@@ -19,7 +19,7 @@ import {
 // everything this file does with it.
 type Point3 = [number, number, number];
 
-export type PromptMode = "point" | "box";
+export type PromptMode = "point" | "box" | "scribble" | "lasso";
 
 interface UseInteractivePromptToolArgs {
 	enabled: boolean;
@@ -44,16 +44,22 @@ interface UseInteractivePromptToolArgs {
 	 *  NOT fired on "nothing changed" or on error — the user should be able
 	 *  to immediately retry in place without re-arming the tool. */
 	onComplete?: () => void;
+	/** Remote nnInteractive session callback. When present, proposals stay in a
+	 * separate preview layer until the reader accepts them. */
+	onSubmitPrompt?: (pane: CinePane, point: Point3, box?: [Point3, Point3], include?: boolean, promptType?: PromptMode, stroke?: Point3[]) => Promise<number>;
 }
 
 export function useInteractivePromptTool({
-	enabled, mode, apiBase, caseId, activeSegmentIndex, res, tolerance, onLog, onBusyChange, onComplete,
+	enabled, mode, apiBase, caseId, activeSegmentIndex, res, tolerance, onLog, onBusyChange, onComplete, onSubmitPrompt,
 }: UseInteractivePromptToolArgs) {
 	const [dragStartCanvas, setDragStartCanvas] = useState<[number, number] | null>(null);
 	const [dragStartWorld, setDragStartWorld] = useState<Point3 | null>(null);
 	const [liveBoxCanvas, setLiveBoxCanvas] = useState<[[number, number], [number, number]] | null>(null);
+	const [strokeWorld, setStrokeWorld] = useState<Point3[]>([]);
 	const paneRef = useRef<CinePane | null>(null);
 	const busyRef = useRef(false);
+	const pointDragRef = useRef<{ start: [number, number]; startWorld: Point3; end: [number, number]; endWorld: Point3 } | null>(null);
+	const suppressClickRef = useRef(false);
 	// Drives the applying/success overlay (mirrors CopyAcrossSlicesFlyout's
 	// GuidedStepModal pattern) instead of the tool silently completing with
 	// only a session-log line — a click/box submit is a real server round
@@ -67,10 +73,12 @@ export function useInteractivePromptTool({
 		setDragStartCanvas(null);
 		setDragStartWorld(null);
 		setLiveBoxCanvas(null);
+		setStrokeWorld([]);
 		paneRef.current = null;
 	}, []);
 
-	const submit = useCallback(async (_pane: CinePane, pointWorld: Point3, boxWorld?: [Point3, Point3]) => {		if (busyRef.current) return; // one in-flight request at a time
+	const submit = useCallback(async (_pane: CinePane, pointWorld: Point3, boxWorld?: [Point3, Point3], include = true, stroke?: Point3[]) => {
+		if (busyRef.current) return; // one in-flight request at a time
 		if (activeSegmentIndex == null) {
 			onLog?.("Interactive segment: no target segment selected.");
 			return;
@@ -84,13 +92,15 @@ export function useInteractivePromptTool({
 		setStatus("applying");
 		setStatusMessage(null);
 		try {
-			const changed = await submitInteractiveSegmentPrompt(
-				apiBase,
-				caseId,
-				activeSegmentIndex,
-				{ pointLps: pointWorld, boxLps: boxWorld, tolerance },
-				res,
-			);
+			const changed = onSubmitPrompt
+			? await onSubmitPrompt(_pane, pointWorld, boxWorld, include, mode, stroke)
+				: await submitInteractiveSegmentPrompt(
+					apiBase,
+					caseId,
+					activeSegmentIndex,
+					{ pointLps: pointWorld, boxLps: boxWorld, tolerance },
+					res,
+				);
 			if (changed) {
 				const msg = `Interactive segment (${changed.toLocaleString()} vox)`;
 				onLog?.(msg);
@@ -112,7 +122,7 @@ export function useInteractivePromptTool({
 			busyRef.current = false;
 			onBusyChange?.(false);
 		}
-	}, [apiBase, caseId, activeSegmentIndex, res, tolerance, onLog, onBusyChange, onComplete]);
+	}, [apiBase, caseId, activeSegmentIndex, res, tolerance, onLog, onBusyChange, onComplete, onSubmitPrompt, mode]);
 
 	const dismissStatus = useCallback(() => {
 		setStatus("idle");
@@ -121,11 +131,78 @@ export function useInteractivePromptTool({
 
 	const handleClick = (pane: CinePane) => (e: MouseEvent) => {
 		if (!enabled || mode !== "point") return;
+		if (suppressClickRef.current) { suppressClickRef.current = false; return; }
 		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
 		const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
 		const world = canvasPointToWorld(pane, canvasPos);
 		if (!world) return;
-		void submit(pane, world);
+		void submit(pane, world, undefined, !e.altKey);
+	};
+
+	const handlePointMouseDown = (pane: CinePane) => (e: MouseEvent) => {
+		if (!enabled || mode !== "point" || e.button !== 0) return;
+		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		const canvas: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
+		const world = canvasPointToWorld(pane, canvas);
+		if (world) pointDragRef.current = { start: canvas, startWorld: world, end: canvas, endWorld: world };
+	};
+	const handlePointMouseMove = (pane: CinePane) => (e: MouseEvent) => {
+		if (!enabled || mode !== "point" || !pointDragRef.current) return;
+		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		const canvas: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
+		const world = canvasPointToWorld(pane, canvas);
+		if (world) pointDragRef.current = { ...pointDragRef.current, end: canvas, endWorld: world };
+	};
+	const handlePointMouseUp = (pane: CinePane) => (e: MouseEvent) => {
+		if (!enabled || mode !== "point" || !pointDragRef.current) return;
+		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		const canvas: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
+		const endWorld = canvasPointToWorld(pane, canvas);
+		const drag = pointDragRef.current;
+		pointDragRef.current = null;
+		if (!endWorld || Math.hypot(canvas[0] - drag.start[0], canvas[1] - drag.start[1]) < 4) return;
+		suppressClickRef.current = true;
+		window.setTimeout(() => { suppressClickRef.current = false; }, 0);
+		void submit(pane, drag.startWorld, [drag.startWorld, endWorld], true);
+	};
+
+	const handleContextMenu = (pane: CinePane) => (e: MouseEvent) => {
+		if (!enabled || mode !== "point") return;
+		e.preventDefault();
+		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		const world = canvasPointToWorld(pane, [e.clientX - rect.left, e.clientY - rect.top]);
+		if (world) void submit(pane, world, undefined, false);
+	};
+
+	const handleStrokeMouseDown = (pane: CinePane) => (e: MouseEvent) => {
+		if (!enabled || (mode !== "scribble" && mode !== "lasso")) return;
+		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
+		const world = canvasPointToWorld(pane, canvasPos);
+		if (!world) return;
+		paneRef.current = pane;
+		setDragStartCanvas(canvasPos);
+		setStrokeWorld([world]);
+		setLiveBoxCanvas([canvasPos, canvasPos]);
+	};
+
+	const handleStrokeMouseMove = (pane: CinePane) => (e: MouseEvent) => {
+		if (!enabled || (mode !== "scribble" && mode !== "lasso") || paneRef.current !== pane || !dragStartCanvas) return;
+		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		const canvasPos: [number, number] = [e.clientX - rect.left, e.clientY - rect.top];
+		const world = canvasPointToWorld(pane, canvasPos);
+		if (!world) return;
+		setStrokeWorld((old) => [...old, world]);
+		setLiveBoxCanvas([dragStartCanvas, canvasPos]);
+	};
+
+	const handleStrokeMouseUp = (pane: CinePane) => (e: MouseEvent) => {
+		if (!enabled || (mode !== "scribble" && mode !== "lasso") || paneRef.current !== pane) return;
+		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		const end = canvasPointToWorld(pane, [e.clientX - rect.left, e.clientY - rect.top]);
+		const points = end ? [...strokeWorld, end] : strokeWorld;
+		reset();
+		if (points.length) void submit(pane, points[0], undefined, true, points);
 	};
 
 	// Box mode: mousedown starts the drag, mousemove updates the live preview
@@ -183,9 +260,16 @@ export function useInteractivePromptTool({
 		statusMessage,
 		dismissStatus,
 		handleClick,
+		handlePointMouseDown,
+		handlePointMouseMove,
+		handlePointMouseUp,
+		handleContextMenu,
 		handleMouseDown,
 		handleMouseMove,
 		handleMouseUp,
+		handleStrokeMouseDown,
+		handleStrokeMouseMove,
+		handleStrokeMouseUp,
 		cancel: reset,
 		reset,
 	};

@@ -11,6 +11,7 @@ import vtkImageMarchingCubes from "@kitware/vtk.js/Filters/General/ImageMarching
 import type { MaskingArea } from "../components/segmentation/MaskingSelect";
 import { createOperationGeneration } from "./viewer/operationGeneration";
 import { rollbackVolumeUpgrade } from "./viewer/volumeUpgrade";
+import { mergeInteractiveLabel, roundedIJK, type IJK } from "./interactiveSegmentation";
 type viewportIdTypes = 'CT_NIFTI_AXIAL' | 'CT_NIFTI_SAGITTAL' | 'CT_NIFTI_CORONAL';
 
 const {
@@ -107,6 +108,7 @@ const DEFAULT_SEGMENTATION_CONFIG = {
 
 
 let segmentationId = "";
+let _interactivePreviewId: string | null = null;
 
 const viewportId1 = "CT_NIFTI_AXIAL";
 const viewportId2 = "CT_NIFTI_SAGITTAL";
@@ -257,6 +259,7 @@ function _disposeViewerContext(context: ViewerResourceContext) {
     return;
   }
   context.disposed = true;
+  clearInteractivePreviewSegmentation();
   const ownsActiveViewer = _activeViewerContext === context;
 
   _removeContextSegmentation(context);
@@ -3436,6 +3439,13 @@ export function canvasPointToWorld(pane: CinePane, canvasPos: Point2): Point3 | 
   }
 }
 
+/** Convert Cornerstone LPS world coordinates to the NIfTI/model [i,j,k] axes. */
+export function worldToInteractiveIJK(world: Point3): IJK {
+  const volume = _currentCtVolumeId ? cache.getVolume(_currentCtVolumeId) : undefined;
+  if (!volume) throw new Error("The CT volume is not ready for interactive prompts");
+  return roundedIJK(volume.imageData.worldToIndex(world), volume.dimensions);
+}
+
 export function worldToCanvasPoint(pane: CinePane, world: Point3): [number, number] | null {
   const engine = getRenderingEngine(renderingEngineId);
   if (!engine) return null;
@@ -6117,6 +6127,126 @@ export function setActiveEditSegment(segmentIndex: number) {
   } catch {
     /* segmentation not loaded yet */
   }
+}
+
+/** Create a separate temporary labelmap so model proposals never touch the
+ * committed working labelmap until the user accepts them. */
+export async function createInteractivePreviewSegmentation(): Promise<boolean> {
+  clearInteractivePreviewSegmentation();
+  if (!_currentCtVolumeId || !currentRenderingEngine || !cache.getVolume(_currentCtVolumeId)) return false;
+  const previewId = `bodymaps-interactive-preview-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    volumeLoader.createAndCacheDerivedLabelmapVolume(_currentCtVolumeId, {
+      volumeId: previewId,
+      targetBuffer: { type: "Uint8Array" },
+    });
+    const labelmap = csToolsEnums.SegmentationRepresentations.Labelmap;
+    segmentation.addSegmentations([{
+      segmentationId: previewId,
+      representation: { type: labelmap, data: { volumeId: previewId } },
+    }]);
+    for (const viewportId of MPR_VIEWPORT_IDS) {
+      await segmentation.addSegmentationRepresentations(viewportId, [{
+        segmentationId: previewId,
+        type: labelmap,
+      }]);
+      try {
+        segmentation.config.color.setSegmentIndexColor(viewportId, previewId, 1, [255, 165, 0, 180]);
+      } catch { /* optional style API */ }
+      try {
+        segmentation.config.visibility.setSegmentIndexVisibility(viewportId,
+          { segmentationId: previewId, type: labelmap }, 1, true);
+      } catch { /* visible by default */ }
+    }
+    _interactivePreviewId = previewId;
+    _activeViewerContext?.volumeIds.add(previewId);
+    currentRenderingEngine.renderViewports([...MPR_VIEWPORT_IDS]);
+    return true;
+  } catch (error) {
+    try { cache.removeVolumeLoadObject(previewId); } catch { /* not cached */ }
+    console.warn("Could not create the interactive preview layer", error);
+    return false;
+  }
+}
+
+export function clearInteractivePreviewSegmentation() {
+  const previewId = _interactivePreviewId;
+  if (!previewId) return;
+  for (const viewportId of MPR_VIEWPORT_IDS) {
+    try {
+      (segmentation as any).removeSegmentationRepresentations?.(viewportId, {
+        segmentationId: previewId,
+        type: csToolsEnums.SegmentationRepresentations.Labelmap,
+      });
+    } catch { /* representation already removed */ }
+  }
+  try { (segmentation as any).removeSegmentation?.(previewId); } catch { /* already removed */ }
+  try { cache.removeVolumeLoadObject(previewId); } catch { /* already evicted */ }
+  _activeViewerContext?.volumeIds.delete(previewId);
+  _interactivePreviewId = null;
+  currentRenderingEngine?.renderViewports([...MPR_VIEWPORT_IDS]);
+}
+
+export function setInteractivePreviewRegion(
+  bbox: [[number, number], [number, number], [number, number]],
+  shape: [number, number, number],
+  bytes: Uint8Array,
+) {
+  const volume = _interactivePreviewId ? cache.getVolume(_interactivePreviewId) : undefined;
+  const vm = volume?.voxelManager as any;
+  if (!vm) throw new Error("Interactive preview layer is unavailable");
+  if (bytes.length !== shape[0] * shape[1] * shape[2]) throw new Error("Interactive preview data has the wrong size");
+  for (let i = 0; i < shape[0]; i++) {
+    for (let j = 0; j < shape[1]; j++) {
+      for (let k = 0; k < shape[2]; k++) {
+        vm.setAtIJK(bbox[0][0] + i, bbox[1][0] + j, bbox[2][0] + k,
+          bytes[(i * shape[1] + j) * shape[2] + k] ? 1 : 0);
+      }
+    }
+  }
+  currentRenderingEngine?.renderViewports([...MPR_VIEWPORT_IDS]);
+}
+
+/** Merge an accepted model region into the working labelmap and register it
+ * with the regular undo history. This never writes canonical dataset files. */
+export function applyInteractiveCommit(
+  bbox: [[number, number], [number, number], [number, number]],
+  shape: [number, number, number],
+  bytes: Uint8Array,
+  segmentIndex: number,
+  allowOverwriteOtherOrgans = false,
+): number {
+  const volume = cache.getVolume(segmentationId);
+  const vm = volume?.voxelManager as any;
+  if (!vm) throw new Error("No working labelmap is loaded");
+  if (bytes.length !== shape[0] * shape[1] * shape[2]) throw new Error("Accepted mask data has the wrong size");
+  const touched: Array<{ i: number; j: number; k: number; before: number; after: number }> = [];
+  for (let i = 0; i < shape[0]; i++) {
+    for (let j = 0; j < shape[1]; j++) {
+      for (let k = 0; k < shape[2]; k++) {
+        const x = bbox[0][0] + i;
+        const y = bbox[1][0] + j;
+        const z = bbox[2][0] + k;
+        const before = Number(vm.getAtIJK(x, y, z));
+        const next = mergeInteractiveLabel(before, bytes[(i * shape[1] + j) * shape[2] + k], segmentIndex, allowOverwriteOtherOrgans);
+        if (before === next) continue;
+        touched.push({ i: x, j: y, k: z, before, after: next });
+        vm.setAtIJK(x, y, z, next);
+      }
+    }
+  }
+  if (touched.length) {
+    const applyValues = (getValue: (item: typeof touched[number]) => number) => {
+      for (const item of touched) vm.setAtIJK(item.i, item.j, item.k, getValue(item));
+      _notifySegmentationChanged();
+    };
+    _notifySegmentationChanged();
+    pushEditHistory({
+      undo: () => applyValues((item) => item.before),
+      redo: () => applyValues((item) => item.after),
+    });
+  }
+  return touched.length;
 }
 
 // Module-level: which segments the brush is currently allowed to paint over,

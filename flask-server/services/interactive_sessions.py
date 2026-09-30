@@ -54,6 +54,10 @@ class InteractiveSession:
     image: np.ndarray
     target: np.ndarray
     remote: Any
+    seed_target: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=np.uint8))
+    label_id: int | None = None
+    room_id: str | None = None
+    charged_users: set[str] = field(default_factory=set)
     created_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
     prompts: list[dict[str, Any]] = field(default_factory=list)
@@ -97,9 +101,12 @@ def _snapshot_prompt(prompt: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _replay(remote, image: np.ndarray, target: np.ndarray, prompts: list[dict[str, Any]]) -> None:
+def _replay(remote, image: np.ndarray, target: np.ndarray, prompts: list[dict[str, Any]], seed_target: np.ndarray | None = None) -> None:
     remote.set_image(image[np.newaxis, ...])
     remote.set_target_buffer(target)
+    if seed_target is not None and seed_target.size and seed_target.any():
+        target[...] = seed_target
+        remote.add_initial_seg_interaction(seed_target, run_prediction=False)
     for item in prompts:
         kind = item["type"]
         include = bool(item.get("include", True))
@@ -119,46 +126,101 @@ class InteractiveSessionManager:
     def __init__(self):
         self._sessions: dict[str, InteractiveSession] = {}
         self._lock = threading.RLock()
+        self._stop_reaper = threading.Event()
+        self._reaper = threading.Thread(target=self._reaper_loop, name="nninteractive-idle-reaper", daemon=True)
+        self._reaper.start()
+
+    def _reaper_loop(self) -> None:
+        while not self._stop_reaper.wait(30):
+            self.reap_idle()
 
     def active_count(self, owner_id: str) -> int:
         with self._lock:
             return sum(item.owner_id == owner_id for item in self._sessions.values())
 
-    def create(self, owner_id: str, dataset: str, case_id: str, image: np.ndarray) -> InteractiveSession:
+    def create(self, owner_id: str, dataset: str, case_id: str, image: np.ndarray, room_id: str | None = None,
+               initial_mask: np.ndarray | None = None, label_id: int | None = None) -> InteractiveSession:
         self.reap_idle()
-        target = np.zeros(image.shape, dtype=np.uint8)
-        remote = make_remote_session()
+        seed_target = np.zeros(image.shape, dtype=np.uint8) if initial_mask is None else np.ascontiguousarray(initial_mask, dtype=np.uint8)
+        if seed_target.shape != image.shape:
+            raise InteractiveError("Initial organ mask does not match the CT volume")
+        target = seed_target.copy()
+        try:
+            remote = make_remote_session()
+        except Exception as exc:
+            if _is_capacity(exc):
+                raise InteractiveCapacity("nnInteractive server is at capacity") from exc
+            if _is_timeout(exc):
+                raise InteractiveTimeout("nnInteractive server timed out") from exc
+            raise
         try:
             remote.set_image(image[np.newaxis, ...])
             remote.set_target_buffer(target)
-        except Exception:
+            if seed_target.any():
+                remote.add_initial_seg_interaction(seed_target, run_prediction=False)
+        except Exception as exc:
             try:
                 remote.close()
             except Exception:
                 pass
+            if _is_capacity(exc):
+                raise InteractiveCapacity("nnInteractive server is at capacity") from exc
+            if _is_timeout(exc):
+                raise InteractiveTimeout("nnInteractive server timed out") from exc
             raise
-        item = InteractiveSession(str(uuid.uuid4()), owner_id, dataset, case_id, image, target, remote)
+        item = InteractiveSession(str(uuid.uuid4()), owner_id, dataset, case_id, image, target, remote,
+                                  seed_target=seed_target, label_id=label_id,
+                                  room_id=room_id, charged_users={owner_id})
         with self._lock:
             self._sessions[item.session_id] = item
         return item
 
-    def get(self, session_id: str, owner_id: str) -> InteractiveSession:
+    def get(self, session_id: str, owner_id: str, room_id: str | None = None) -> InteractiveSession:
         with self._lock:
             item = self._sessions.get(session_id)
-        if item is None or item.owner_id != owner_id:
+        if item is None or (item.owner_id != owner_id and (not room_id or item.room_id != room_id)):
             raise InteractiveNotFound("Interactive session not found")
         return item
 
+    def find_room(self, room_id: str) -> InteractiveSession | None:
+        with self._lock:
+            return next((item for item in self._sessions.values() if item.room_id == room_id), None)
+
     def _replace_remote(self, item: InteractiveSession) -> None:
+        old_remote = item.remote
         try:
-            item.remote.close()
+            if old_remote is not None:
+                old_remote.close()
         except Exception:
             pass
-        item.target.fill(0)
-        item.remote = make_remote_session()
-        _replay(item.remote, item.image, item.target, item.prompts)
+        prior_target = item.target.copy()
+        replacement_target = prior_target.copy()
+        replacement = None
+        try:
+            replacement = make_remote_session()
+            _replay(replacement, item.image, replacement_target, item.prompts, item.seed_target)
+        except Exception as exc:
+            if replacement is not None:
+                try:
+                    replacement.close()
+                except Exception:
+                    pass
+            item.remote = None
+            item.target[...] = prior_target
+            if _is_capacity(exc):
+                raise InteractiveCapacity("nnInteractive server is at capacity") from exc
+            if _is_timeout(exc):
+                raise InteractiveTimeout("nnInteractive server timed out") from exc
+            raise InteractiveExpired("nnInteractive session expired; replay recovery failed") from exc
+        item.remote = replacement
+        item.target[...] = replacement_target
+
+    def _ensure_remote(self, item: InteractiveSession) -> None:
+        if item.remote is None:
+            self._replace_remote(item)
 
     def apply(self, item: InteractiveSession, kind: str, prompt: dict[str, Any]) -> list[list[int]]:
+        self._ensure_remote(item)
         methods = {
             "point": lambda: item.remote.add_point_interaction(
                 prompt["coordinates"], include_interaction=prompt["include"]
@@ -202,13 +264,18 @@ class InteractiveSessionManager:
         return _tight_bbox(previous != item.target)
 
     def undo(self, item: InteractiveSession) -> list[list[int]] | None:
+        self._ensure_remote(item)
         before = item.target.copy()
         try:
             ok = item.remote.undo()
         except Exception as exc:
             if _is_expired(exc):
                 self._replace_remote(item)
-                ok = False
+                raise InteractiveExpired("nnInteractive session expired; the session was restored. Retry the action.") from exc
+            elif _is_capacity(exc):
+                raise InteractiveCapacity("nnInteractive server is at capacity") from exc
+            elif _is_timeout(exc):
+                raise InteractiveTimeout("nnInteractive server timed out") from exc
             else:
                 raise
         if ok and item.prompts:
@@ -217,13 +284,83 @@ class InteractiveSessionManager:
         return _tight_bbox(before != item.target) if ok else None
 
     def reset(self, item: InteractiveSession) -> None:
-        item.remote.reset_interactions()
-        item.target.fill(0)
+        self._ensure_remote(item)
+        try:
+            item.remote.reset_interactions()
+        except Exception as exc:
+            if _is_expired(exc):
+                self._replace_remote(item)
+                item.remote.reset_interactions()
+            elif _is_capacity(exc):
+                raise InteractiveCapacity("nnInteractive server is at capacity") from exc
+            elif _is_timeout(exc):
+                raise InteractiveTimeout("nnInteractive server timed out") from exc
+            else:
+                raise
+        item.target[...] = item.seed_target
+        if item.seed_target.any():
+            item.remote.add_initial_seg_interaction(item.seed_target, run_prediction=False)
         item.prompts.clear()
         item.last_used = time.time()
 
-    def close(self, session_id: str, owner_id: str) -> None:
-        item = self.get(session_id, owner_id)
+    def select_target(self, item: InteractiveSession, label_id: int, seed: np.ndarray | None) -> None:
+        self._ensure_remote(item)
+        seed_target = np.zeros(item.image.shape, dtype=np.uint8) if seed is None else np.ascontiguousarray(seed, dtype=np.uint8)
+        if seed_target.shape != item.image.shape:
+            raise InteractiveError("Initial organ mask does not match the CT volume")
+        try:
+            item.remote.reset_interactions()
+            item.target[...] = seed_target
+            if seed_target.any():
+                item.remote.add_initial_seg_interaction(seed_target, run_prediction=False)
+        except Exception as exc:
+            if _is_expired(exc):
+                self._replace_remote(item)
+                item.remote.reset_interactions()
+                item.target[...] = seed_target
+                if seed_target.any():
+                    item.remote.add_initial_seg_interaction(seed_target, run_prediction=False)
+            elif _is_capacity(exc):
+                raise InteractiveCapacity("nnInteractive server is at capacity") from exc
+            elif _is_timeout(exc):
+                raise InteractiveTimeout("nnInteractive server timed out") from exc
+            else:
+                raise
+        item.seed_target = seed_target
+        item.label_id = label_id
+        item.prompts.clear()
+        item.last_used = time.time()
+
+    def accept(self, item: InteractiveSession) -> None:
+        self._ensure_remote(item)
+        """Promote the current proposal to this organ's next refinement seed."""
+        accepted_target = item.target.copy()
+        try:
+            item.remote.reset_interactions()
+            item.target[...] = accepted_target
+            item.seed_target = accepted_target
+            item.prompts.clear()
+            if item.seed_target.any():
+                item.remote.add_initial_seg_interaction(item.seed_target, run_prediction=False)
+        except Exception as exc:
+            if _is_expired(exc):
+                self._replace_remote(item)
+                item.remote.reset_interactions()
+                item.target[...] = accepted_target
+                item.seed_target = accepted_target
+                item.prompts.clear()
+                if item.seed_target.any():
+                    item.remote.add_initial_seg_interaction(item.seed_target, run_prediction=False)
+            elif _is_capacity(exc):
+                raise InteractiveCapacity("nnInteractive server is at capacity") from exc
+            elif _is_timeout(exc):
+                raise InteractiveTimeout("nnInteractive server timed out") from exc
+            else:
+                raise
+        item.last_used = time.time()
+
+    def close(self, session_id: str, owner_id: str, room_id: str | None = None) -> None:
+        item = self.get(session_id, owner_id, room_id)
         with self._lock:
             self._sessions.pop(session_id, None)
         try:
@@ -248,6 +385,7 @@ class InteractiveSessionManager:
         return len(items)
 
     def close_all(self) -> None:
+        self._stop_reaper.set()
         with self._lock:
             items = list(self._sessions.values())
             self._sessions.clear()
@@ -293,4 +431,3 @@ def decode_crop(value: Any, bbox: list[list[int]], shape: tuple[int, int, int]) 
     if crop.shape != expected or crop.size > 1_000_000 or np.any(crop > 1):
         raise InteractiveError("crop dimensions or values are invalid")
     return crop.astype(bool)
-
