@@ -17,7 +17,7 @@
     "@cornerstonejs/dicom-image-loader": "^4.22.13",
     "@cornerstonejs/nifti-volume-loader": "^4.20.3",
     "@cornerstonejs/tools": "^4.20.3",
-    "@kitware/vtk.js": "34.15.1",
+    "@kitware/vtk.js": "37.3.1",
     "@niivue/niivue": "^0.62.1",
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.6.1",
