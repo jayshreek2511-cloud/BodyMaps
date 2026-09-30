@@ -13,7 +13,7 @@ Flask-SQLAlchemy==3.1.1
 # Offline IP -> city lookups for the analytics map. Needs a GeoLite2-City.mmdb
 # on disk (scripts/download_geolite.py); absent, lookups return None.
 geoip2==5.3.0
-greenlet==3.1.1
+greenlet==3.5.6
 gunicorn==23.0.0
 idna==3.10
 iniconfig==2.3.0
