@@ -249,6 +249,11 @@ def test_reaccept_region_includes_removed_seed_voxels(client):
     item = interactive.manager.get(sid, "researcher")
     assert int(item.seed_target.sum()) == 14
     assert int(item.target.sum()) == 14
+    switched = http.post("/api/interactive/select-organ", json={"session_id": sid, "label_id": 24})
+    assert switched.status_code == 200 and switched.json["seeded_mask"] is None
+    returned = http.post("/api/interactive/select-organ", json={"session_id": sid, "label_id": 23})
+    assert returned.status_code == 200
+    assert np.frombuffer(_region_bytes(returned.json["seeded_mask"]), dtype=np.uint8).sum() == 14
 
 
 def test_expired_remote_session_is_recreated_and_prompts_are_replayed(monkeypatch):

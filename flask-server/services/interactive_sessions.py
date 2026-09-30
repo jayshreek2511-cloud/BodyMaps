@@ -56,6 +56,7 @@ class InteractiveSession:
     remote: Any
     seed_target: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=np.uint8))
     label_id: int | None = None
+    organ_targets: dict[int, np.ndarray] = field(default_factory=dict)
     room_id: str | None = None
     charged_users: set[str] = field(default_factory=set)
     created_at: float = field(default_factory=time.time)
@@ -305,6 +306,11 @@ class InteractiveSessionManager:
 
     def select_target(self, item: InteractiveSession, label_id: int, seed: np.ndarray | None) -> None:
         self._ensure_remote(item)
+        if item.label_id is not None and item.label_id in item.organ_targets:
+            item.organ_targets[item.label_id] = item.seed_target.copy()
+        saved_seed = item.organ_targets.get(label_id)
+        if saved_seed is not None:
+            seed = saved_seed
         seed_target = np.zeros(item.image.shape, dtype=np.uint8) if seed is None else np.ascontiguousarray(seed, dtype=np.uint8)
         if seed_target.shape != item.image.shape:
             raise InteractiveError("Initial organ mask does not match the CT volume")
@@ -358,6 +364,8 @@ class InteractiveSessionManager:
             else:
                 raise
         item.last_used = time.time()
+        if item.label_id is not None:
+            item.organ_targets[item.label_id] = item.seed_target.copy()
 
     def close(self, session_id: str, owner_id: str, room_id: str | None = None) -> None:
         item = self.get(session_id, owner_id, room_id)
