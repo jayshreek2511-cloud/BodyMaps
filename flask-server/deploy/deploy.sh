@@ -58,6 +58,18 @@ command -v curl >/dev/null 2>&1 || die "curl is not on PATH"
 free_kb=$(df -Pk "$REPO" | awk 'NR==2 {print $4}')
 [ "${free_kb:-0}" -ge 2097152 ] || die "less than 2 GB free disk at $REPO"
 echo "preflight ok (repo, conda env, npm, curl, disk)"
+if [ -f "$REPO/flask-server/.env" ] && grep -Eq '^NNINTERACTIVE_ENABLED=true([[:space:]]|$)' "$REPO/flask-server/.env"; then
+  nninteractive_url="${NNINTERACTIVE_SERVER_URL:-}"
+  if [ -z "$nninteractive_url" ]; then
+    nninteractive_url=$(sed -n 's/^NNINTERACTIVE_SERVER_URL=["\x27]*\([^"\x27[:space:]]*\).*/\1/p' "$REPO/flask-server/.env" | tail -1)
+  fi
+  nninteractive_url="${nninteractive_url:-http://127.0.0.1:1527}"
+  if curl -fsS --max-time 5 "${nninteractive_url%/}/healthz" >/dev/null; then
+    echo "nnInteractive reachable at $nninteractive_url"
+  else
+    echo "WARNING: nnInteractive is enabled but $nninteractive_url/healthz did not respond (continuing preflight)"
+  fi
+fi
 if [ "${1:-}" = "check" ]; then
   echo "check mode: stopping here - nothing was changed."
   exit 0

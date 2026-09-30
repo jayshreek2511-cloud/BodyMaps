@@ -4,7 +4,7 @@
 
 1. **Plan and local mock:** document the data flow and coordinate contract; provide a deterministic fake remote session that can be selected without installing or running a GPU model.
 2. **Backend sessions and endpoints:** add a feature-flagged blueprint, per-user/per-room remote sessions, full-resolution image loading, prompt validation, compressed region deltas, commit without writing canonical dataset files, auth/verification/quota checks, cleanup, and mocked service tests.
-3. **Viewer tools:** add the API client, coordinate conversion helper and tests, preview overlay, prompt controls, accept/undo/reset, status and license disclosure; keep all controls hidden when the feature is disabled.
+3. **Viewer tools:** add the API client, coordinate conversion helper and tests, a separate preview overlay, organ-first prompt controls, accept/undo/reset, per-organ prompt status, keyboard shortcuts, and license disclosure; keep all controls hidden when the feature is disabled.
 4. **Live Rooms:** serialize room prompts, commit/broadcast prediction deltas through the existing room event stream, and include prompt provenance in room exports.
 5. **Operations:** document environment settings, GPU Docker deployment, nginx proxy requirements, worker-count constraints, and an optional deploy preflight; add a README link.
 
@@ -20,6 +20,8 @@
 
 The nnInteractive remote API expects a four-dimensional image shaped `[C, X, Y, Z]`; its target mask is three-dimensional `[X, Y, Z]`. The BodyMaps NIfTI loader uses nibabel's voxel array order `(i, j, k)` and the current Cornerstone volume reports IJK dimensions in the same voxel-axis order. Thus the model coordinate `[x, y, z]` is the viewer voxel IJK `[i, j, k]` after converting a pointer's world LPS millimetres through the NIfTI affine (`LPS -> RAS -> inverse affine -> nearest voxel`). It is not an array `z,y,x` transpose. Screen axes vary by MPR plane, so the frontend helper must use the active pane's world-to-index transform and pin the pane's slice axis before serializing a 2D prompt. Every emitted bbox/crop must have exactly one axis of length one, use half-open bounds, and be checked against the original volume shape.
 
+The frontend's selected segment ID is the scalar value in the working labelmap and is used as the accepted label value; its existing label entry supplies the displayed organ name and color. For seeded refinement, Flask reads the same ID from the case's canonical `mask_only/<case>/combined_labels.nii.gz` without writing to it, converts it to a binary seed, and passes it through `add_initial_seg_interaction`. If the canonical label file is absent, the selected organ starts empty. This assumes viewer label values match the canonical combined-label values; user-created or locally modified labels without a canonical value can still be selected, but they start with an empty seed.
+
 For Live Room masks, the existing durable mask-patch protocol uses flat C-order offsets over the viewer's `[X,Y,Z]` label array. The server's `[X,Y,Z]` prediction delta must therefore be flattened with the same C order before it is encoded into room mask ranges.
 
 ## Assumptions and constraints
@@ -32,3 +34,5 @@ For Live Room masks, the existing durable mask-patch protocol uses flat C-order 
 - Preview masks remain separate from the canonical dataset labelmap until accepted. User acceptance writes only to an owned session/room working mask; canonical dataset files are immutable.
 - Model weights are CC BY-NC-SA 4.0; the UI and deployment notes disclose research-use restrictions. Maintainers must confirm their deployment and use comply with that license before enabling the feature publicly.
 - Expired remote sessions are recoverable only when the server supports session creation and prompt replay; replay is bounded to the stored prompt log and all operations remain serialized.
+- One Flask session retains the original CT while the user switches organ IDs. Switching resets the prompt history for the active target and seeds from that target's canonical mask; accepting replaces only voxels owned by the selected label unless the explicit overwrite toggle is enabled. The union of the seed and new proposal is returned so a smaller re-accepted mask can clear its removed voxels.
+- Keyboard shortcuts while an interactive session is active: Enter accepts, Escape discards pending prompts back to the seed, Ctrl/Cmd+Z undoes the last prompt, and R resets prompts to the selected organ's seed. In point mode left click is positive, right click or Alt-click is negative, and dragging submits a current-slice box.

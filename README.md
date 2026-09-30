@@ -6,6 +6,22 @@ Dataset viewer supports temporary, account-free collaborative review at `/live/<
 
 Deployment and local service instructions: [`flask-server/deploy/LIVE_ROOMS.md`](flask-server/deploy/LIVE_ROOMS.md).
 
+## Interactive segmentation
+
+Interactive 3D segmentation is an opt-in research feature. It uses a separate
+GPU service and keeps model previews separate from the working labelmap until
+accepted. Setup, local mock flow, proxy requirements, quotas, and licensing are
+documented in [`flask-server/deploy/nninteractive.md`](flask-server/deploy/nninteractive.md);
+the GPU service compose file is [`docker-compose.nninteractive.yml`](docker-compose.nninteractive.yml).
+Select an organ from the viewer's existing label list to seed it from its current
+mask. Point mode uses left-click for positive prompts, right-click or Alt-click
+for negative prompts, and drag for a box. Accept applies the proposal to the
+selected label through viewer undo history and keeps the same volume session
+open for switching to another organ. Other organs are protected from overwrite
+unless “Allow overwriting other organs” is enabled. Enter accepts, Escape resets
+the preview to the organ's seed, Ctrl/Cmd+Z undoes the last prompt, and R resets
+the current prompts.
+
 #### Create Conda Environment
 ```
 conda create -n PanTS_backend python=3.11

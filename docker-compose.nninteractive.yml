@@ -1,0 +1,23 @@
+services:
+  nninteractive:
+    image: ghcr.io/mic-dkfz/nninteractive-server:latest
+    restart: unless-stopped
+    ports:
+      # Keep the GPU API private to this host. Use a private interface only
+      # when Flask runs on a different machine and firewall it to Flask hosts.
+      - "127.0.0.1:1527:1527"
+    environment:
+      NN_INTERACTIVE_API_KEY: ${NN_INTERACTIVE_API_KEY:?Set NN_INTERACTIVE_API_KEY in the GPU host environment}
+      NNINTERACTIVE_MODEL: ${NNINTERACTIVE_MODEL:-nnInteractive_v1.0}
+    command:
+      - --max-sessions
+      - ${NNINTERACTIVE_MAX_SESSIONS:-4}
+      - --idle-timeout-seconds
+      - ${NNINTERACTIVE_SERVER_IDLE_SECONDS:-900}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
