@@ -2075,14 +2075,14 @@ async def get_segmentations(combined_labels_id):
             # into the dataset's mask_only/ (it is read-only on the server, and an
             # HTTP GET must not mutate ground-truth data). Writing the sibling into
             # mask_only/ 500'd the segmentation endpoint in production.
-            cache_dir = "/tmp/pants_uint8"
+            cache_dir = os.path.join(tempfile.gettempdir(), "pants_uint8")
             os.makedirs(cache_dir, exist_ok=True)
             converted_path = os.path.join(
                 cache_dir,
                 f"{get_panTS_id(secure_filename(combined_labels_id))}_combined_labels_uint8.nii.gz",
             )
             if not os.path.exists(converted_path):
-                print("⚠️ Detected float label map, converting to uint8 for Cornerstone compatibility...")
+                print("Detected non-uint8 label map; converting to uint8 for Cornerstone compatibility...")
                 raw = np.asanyarray(img.dataobj)
                 data = np.rint(raw).astype(np.uint8)
 
@@ -2094,7 +2094,7 @@ async def get_segmentations(combined_labels_id):
         return _serve_dataset_volume(serve_path)
 
     except Exception as e:
-        print(f"❌ [get-segmentations ERROR] {e}")
+        print(f"[get-segmentations ERROR] {e}")
         return jsonify({"error": str(e)}), 500
 
 

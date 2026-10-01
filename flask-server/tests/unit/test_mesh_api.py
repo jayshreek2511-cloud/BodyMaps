@@ -10,6 +10,7 @@ import numpy as np
 from flask import Flask
 
 from api.api_blueprint import api_blueprint
+from api.interactive import interactive_blueprint
 from constants import Constants
 from services.mesh_generation import ensure_case_meshes
 
@@ -82,3 +83,38 @@ def test_mesh_endpoints_reject_invalid_or_missing_cases(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Constants, "PANTS_PATH", None)
     assert client.get("/api/cases/37/mesh-manifest").status_code == 404
+
+
+def test_viewer_case_volumes_load_with_interactive_disabled_or_mock(tmp_path, monkeypatch):
+    pants_path = tmp_path / "pants"
+    display_id = "PanTS_00000001"
+    ct_path = pants_path / "image_only" / display_id / "ct.nii.gz"
+    mask_path = pants_path / "mask_only" / display_id / "combined_labels.nii.gz"
+    ct_path.parent.mkdir(parents=True)
+    mask_path.parent.mkdir(parents=True)
+    ct = np.arange(4 * 5 * 6, dtype=np.int16).reshape((4, 5, 6))
+    labels = np.zeros(ct.shape, dtype=np.int16)
+    labels[1:3, 2:4, 2:5] = 3
+    nib.save(nib.Nifti1Image(ct, np.eye(4)), ct_path)
+    nib.save(nib.Nifti1Image(labels, np.eye(4)), mask_path)
+    monkeypatch.setattr(Constants, "PANTS_PATH", str(pants_path))
+    monkeypatch.setattr("api.api_blueprint.tempfile.tempdir", str(tmp_path / "temp"))
+    app = Flask(__name__)
+    app.register_blueprint(api_blueprint, url_prefix="/api")
+    app.register_blueprint(interactive_blueprint, url_prefix="/api")
+    client = app.test_client()
+
+    for enabled, mock in (("false", "false"), ("true", "true")):
+        monkeypatch.setenv("NNINTERACTIVE_ENABLED", enabled)
+        monkeypatch.setenv("NNINTERACTIVE_MOCK", mock)
+        config = client.get("/api/interactive/config")
+        assert config.status_code == 200
+        assert config.get_json()["enabled"] is (enabled == "true")
+
+        ct_response = client.get("/api/get-main-nifti/1.nii.gz?res=low")
+        mask_response = client.get("/api/get-segmentations/1.nii.gz?res=low")
+        assert ct_response.status_code == 200
+        assert mask_response.status_code == 200
+        converted_path = tmp_path / f"converted-{enabled}.nii.gz"
+        converted_path.write_bytes(mask_response.data)
+        assert nib.load(str(converted_path)).get_data_dtype() == np.uint8
