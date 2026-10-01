@@ -112,7 +112,7 @@ const TOOL_DEFS: Array<{ id: Exclude<PrimaryEditTool, null>; label: string; Icon
 	{ id: "fillBetweenSlices", label: "Fill between slices", Icon: IconStack2, description: "Interpolate a class's shape between two annotated slices." },
 	{ id: "copyAcrossSlices", label: "Copy across slices", Icon: IconCopy, description: "Copy a class's shape from first to last slice." },
 	{ id: "hollow", label: "Hollow", Icon: IconCircleDashed, description: "Make the class hollow by replacing it with a uniform-thickness shell." },
-	{ id: "pointSegment", label: "Interactive point", Icon: IconCircleDashed, description: "Add a positive point; hold Alt for a negative point. The AI proposal stays in preview until accepted." },
+	{ id: "pointSegment", label: "Organ AI", Icon: IconCircleDashed, description: "Click inside an organ for a positive point, right-click or Alt-click outside for a negative point, or drag a box. Review the 3D proposal before accepting." },
 	{ id: "boxSegment", label: "Interactive box", Icon: IconCopy, description: "Drag a box on the current slice to guide a 3D AI proposal." },
 	{ id: "scribbleSegment", label: "Interactive scribble", Icon: IconWaveSine, description: "Draw a short positive scribble on the current slice." },
 	{ id: "lassoSegment", label: "Interactive lasso", Icon: IconScissors, description: "Draw a closed outline on the current slice to guide a 3D AI proposal." },
@@ -778,7 +778,11 @@ export default function AnnotationToolbar({
 		>
 			<div ref={dockContentRef} style={{ display: "flex", alignItems: "center", justifyContent: "center", width: "100%" }}>
 			<div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 13}}>
-				{TOOL_DEFS.filter(({ id }) => interactiveEnabled || !["pointSegment", "boxSegment", "scribbleSegment", "lassoSegment"].includes(id)).map(({ id, label, Icon, description }) => {
+				{TOOL_DEFS.filter(({ id }) => {
+					const interactiveTools = ["pointSegment", "boxSegment", "scribbleSegment", "lassoSegment"];
+					if (interactiveTools.includes(id)) return interactiveEnabled && id === "pointSegment";
+					return true;
+				}).map(({ id, label, Icon, description }) => {
 					// Only equip-and-use tools (paint/erase/scissors/level tracing)
 					// get a settings arrow; other tools open settings on icon click.
 					const hasSettingsArrow =

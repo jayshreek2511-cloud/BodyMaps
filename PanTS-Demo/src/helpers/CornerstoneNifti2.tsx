@@ -11,7 +11,8 @@ import vtkImageMarchingCubes from "@kitware/vtk.js/Filters/General/ImageMarching
 import type { MaskingArea } from "../components/segmentation/MaskingSelect";
 import { createOperationGeneration } from "./viewer/operationGeneration";
 import { rollbackVolumeUpgrade } from "./viewer/volumeUpgrade";
-import { mergeInteractiveLabel, roundedIJK, type IJK } from "./interactiveSegmentation";
+import { mergeInteractiveLabel, type IJK } from "./interactiveSegmentation";
+import { viewerWorldToNiftiIJK } from "./interactiveCoordinates";
 type viewportIdTypes = 'CT_NIFTI_AXIAL' | 'CT_NIFTI_SAGITTAL' | 'CT_NIFTI_CORONAL';
 
 const {
@@ -3439,11 +3440,11 @@ export function canvasPointToWorld(pane: CinePane, canvasPos: Point2): Point3 | 
   }
 }
 
-/** Convert Cornerstone LPS world coordinates to the NIfTI/model [i,j,k] axes. */
+/** Convert LPS world coordinates through the loaded original CT affine to model [i,j,k]. */
 export function worldToInteractiveIJK(world: Point3): IJK {
   const volume = _currentCtVolumeId ? cache.getVolume(_currentCtVolumeId) : undefined;
   if (!volume) throw new Error("The CT volume is not ready for interactive prompts");
-  return roundedIJK(volume.imageData.worldToIndex(world), volume.dimensions);
+  return viewerWorldToNiftiIJK(world, (point) => volume.imageData.worldToIndex(point as Point3), volume.dimensions);
 }
 
 export function worldToCanvasPoint(pane: CinePane, world: Point3): [number, number] | null {
