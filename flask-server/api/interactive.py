@@ -24,6 +24,7 @@ from services.interactive_sessions import (
 interactive_blueprint = Blueprint("interactive", __name__)
 manager = InteractiveSessionManager()
 _quota_lock = threading.RLock()
+_user_sessions: dict[str, str] = {}
 atexit.register(manager.close_all)
 
 
@@ -249,15 +250,24 @@ def interactive_start():
             return jsonify({"error": "Daily interactive session limit reached", "code": "daily_quota_exceeded",
                             "limit": quota}), 429
         manager.reap_idle()
-        if manager.active_count(str(user["id"])) >= active_max:
+        user_id = str(user["id"])
+        previous_session = _user_sessions.get(user_id)
+        if previous_session:
+            try:
+                manager.close(previous_session, user_id)
+            except InteractiveNotFound:
+                pass  # It may have expired and been reaped already.
+            _user_sessions.pop(user_id, None)
+        if manager.active_count(user_id) >= active_max:
             return jsonify({"error": "Too many active interactive sessions", "code": "active_session_limit",
                             "limit": active_max}), 429
         image = _load_original_ct(dataset, case_id)
         initial_label = body.get("initial_mask_label")
         seed = _load_initial_mask(dataset, case_id, initial_label, image.shape) if initial_label is not None else None
-        item = manager.create(str(user["id"]), dataset, case_id, image, room_id=room_id,
+        item = manager.create(user_id, dataset, case_id, image, room_id=room_id,
                               initial_mask=seed, label_id=initial_label)
-        plan_store.record_interactive_session(str(user["id"]), item.session_id)
+        _user_sessions[user_id] = item.session_id
+        plan_store.record_interactive_session(user_id, item.session_id)
     return jsonify({"session_id": item.session_id, "shape": list(item.image.shape),
                     "dtype": str(item.image.dtype), "dataset": dataset, "case_id": case_id,
                     "room_id": room_id,
@@ -403,6 +413,8 @@ def interactive_close():
     if item is None:
         return user
     manager.close(item.session_id, str(user["id"]), item.room_id)
+    if item.room_id is None and _user_sessions.get(str(user["id"])) == item.session_id:
+        _user_sessions.pop(str(user["id"]), None)
     return jsonify({"closed": True}), 200
 
 
