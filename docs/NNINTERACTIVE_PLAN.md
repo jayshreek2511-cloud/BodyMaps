@@ -1,38 +1,29 @@
-# nnInteractive integration plan
+# nnInteractive organ-edit workflow
 
-## Scope and phases
+## Existing work and scope
 
-1. **Plan and local mock:** document the data flow and coordinate contract; provide a deterministic fake remote session that can be selected without installing or running a GPU model.
-2. **Backend sessions and endpoints:** add a feature-flagged blueprint, per-user/per-room remote sessions, full-resolution image loading, prompt validation, compressed region deltas, commit without writing canonical dataset files, auth/verification/quota checks, cleanup, and mocked service tests.
-3. **Viewer tools:** add the API client, coordinate conversion helper and tests, a separate preview overlay, organ-first prompt controls, accept/undo/reset, per-organ prompt status, keyboard shortcuts, and license disclosure; keep all controls hidden when the feature is disabled.
-4. **Live Rooms:** serialize room prompts, commit/broadcast prediction deltas through the existing room event stream, and include prompt provenance in room exports.
-5. **Operations:** document environment settings, GPU Docker deployment, nginx proxy requirements, worker-count constraints, and an optional deploy preflight; add a README link.
+- The current branch already implements Flask-managed remote sessions, raw full-resolution CT input, per-organ seeding, prompt preview/accept/undo/reset, protected label merges, keyboard shortcuts, an explicit local mock, and a GPU smoke script. This task reuses that work.
+- Existing implementation arrived in `c2a2b19` (mock/plan), `2c0e2fe` (backend), `1b160c6` (organ-first viewer), and `f8d3b28` (deployment/smoke); later fixes `56ab8e9` and `220c0e1` were also present before this task.
+- Keep `NNINTERACTIVE_ENABLED=false` by default. The server owns the API key; the browser uses the existing Flask endpoints. Canonical dataset files remain read-only.
+- This change is limited to route gating, one Organ AI toolbar entry, and directly tested coordinate conversion. Existing brush and eraser remain unchanged.
 
-## Files expected to change
+## Case 4 inspection (2026-10-01)
 
-- Backend: `flask-server/app.py`, `flask-server/constants.py`, `flask-server/requirements.txt`, `flask-server/.env.example`, `flask-server/api/interactive.py`, `flask-server/services/interactive_sessions.py`, `flask-server/services/nninteractive_predictor.py`, `flask-server/services/plan_store.py`, `flask-server/models/usage_event.py`, `flask-server/migrations/env.py`, and a new Alembic revision only if existing usage bookkeeping cannot safely represent the separate quota.
-- Backend tests: new unit and functional tests under `flask-server/tests/` for mock and remote adapter behavior, validation, authorization, quota, server errors, recovery, deltas, and canonical-file immutability.
-- Frontend: a new API/helper module and coordinate helper under `PanTS-Demo/src/helpers/`, interactive controls and preview UI under `PanTS-Demo/src/components/` and `PanTS-Demo/src/routes/VisualizationPage.tsx`, plus focused Vitest coverage.
-- Live Rooms and deploy: `flask-server/live_rooms_ws.py`, `flask-server/services/live_room_store.py`, `flask-server/deploy/deploy.sh`, new `flask-server/deploy/nninteractive.md`, root `docker-compose.nninteractive.yml`, and `README.md`.
-- Local testing: fake session implementation in `flask-server/services/` selectable with `NNINTERACTIVE_MOCK=true`; this avoids any GPU, model download, or server setup.
+- Original CT and `combined_labels.nii.gz` are both `(503, 324, 223)`, `int16`, with matching affine and `('L','A','I')` orientation.
+- Viewer slice counts are axial `223`, sagittal `503`, coronal `324`; the HD toggle uses the full grid.
+- Lung Left is scalar label ID `15`, with `601,912` voxels and bounds `i=181..400, j=44..218, k=0..190`. Its blockiness is present in the stored labelmap, not caused by a low-resolution display resample.
+- The selected existing-class row provides the label ID, name, and color. The accepted proposal uses that ID/color and protects other label values; preview is a separate layer.
+- Prompt coordinates are Cornerstone LPS world points transformed by the loaded CT's `worldToIndex` to IJK. The NIfTI/model array uses the same `[i,j,k]` order, with no screen-plane permutation.
+- The point tool supports positive left-click, negative right-click/Alt-click, and drag-box. It will be surfaced as one “Organ AI” toolbar entry.
 
-## Coordinate and array convention
+## Planned files
 
-The nnInteractive remote API expects a four-dimensional image shaped `[C, X, Y, Z]`; its target mask is three-dimensional `[X, Y, Z]`. The BodyMaps NIfTI loader uses nibabel's voxel array order `(i, j, k)` and the current Cornerstone volume reports IJK dimensions in the same voxel-axis order. Thus the model coordinate `[x, y, z]` is the viewer voxel IJK `[i, j, k]` after converting a pointer's world LPS millimetres through the NIfTI affine (`LPS -> RAS -> inverse affine -> nearest voxel`). It is not an array `z,y,x` transpose. Screen axes vary by MPR plane, so the frontend helper must use the active pane's world-to-index transform and pin the pane's slice axis before serializing a 2D prompt. Every emitted bbox/crop must have exactly one axis of length one, use half-open bounds, and be checked against the original volume shape.
+- Existing files (5): this plan, `flask-server/app.py`, `flask-server/api/interactive.py`, `PanTS-Demo/src/components/viewer/AnnotationToolbar.tsx`, and `PanTS-Demo/src/helpers/CornerstoneNifti2.tsx`.
+- New files: a feature-gated blueprint-registration helper, a pure coordinate helper, and focused backend/frontend tests.
 
-The frontend's selected segment ID is the scalar value in the working labelmap and is used as the accepted label value; its existing label entry supplies the displayed organ name and color. For seeded refinement, Flask reads the same ID from the case's canonical `mask_only/<case>/combined_labels.nii.gz` without writing to it, converts it to a binary seed, and passes it through `add_initial_seg_interaction`. If the canonical label file is absent, the selected organ starts empty. This assumes viewer label values match the canonical combined-label values; user-created or locally modified labels without a canonical value can still be selected, but they start with an empty seed.
+## Verification boundary
 
-For Live Room masks, the existing durable mask-patch protocol uses flat C-order offsets over the viewer's `[X,Y,Z]` label array. The server's `[X,Y,Z]` prediction delta must therefore be flattened with the same C order before it is encoded into room mask ranges.
-
-## Assumptions and constraints
-
-- `NNINTERACTIVE_ENABLED` remains false by default. A second `NNINTERACTIVE_MOCK` switch is only for local development and tests; it is ignored unless the feature is explicitly enabled.
-- Flask owns every real remote session and is the only component that knows the remote URL and API key. The browser calls Flask with the existing same-origin/API-base conventions.
-- Only logged-in, email-verified accounts with a complete verified-researcher profile (the existing Pro eligibility rule) can start sessions. Quota is a separate rolling 24-hour allowance, independent of scan inference quota.
-- A manager session is scoped to one user and one dataset/case, or to one capability-key Live Room. Every session has a serialization lock. The deployment currently uses one Gunicorn worker; an in-memory manager cannot be shared across workers, so multi-worker deployment requires a shared session coordinator/sticky routing or moving the manager into a dedicated service.
-- CT input is the original full-resolution NIfTI volume read without windowing, normalization, or uint8 conversion. Only returned delta masks use uint8.
-- Preview masks remain separate from the canonical dataset labelmap until accepted. User acceptance writes only to an owned session/room working mask; canonical dataset files are immutable.
-- Model weights are CC BY-NC-SA 4.0; the UI and deployment notes disclose research-use restrictions. Maintainers must confirm their deployment and use comply with that license before enabling the feature publicly.
-- Expired remote sessions are recoverable only when the server supports session creation and prompt replay; replay is bounded to the stored prompt log and all operations remain serialized.
-- One Flask session retains the original CT while the user switches organ IDs. Switching resets the prompt history for the active target and seeds from that target's canonical mask; accepting replaces only voxels owned by the selected label unless the explicit overwrite toggle is enabled. The union of the seed and new proposal is returned so a smaller re-accepted mask can clear its removed voxels.
-- Keyboard shortcuts while an interactive session is active: Enter accepts, Escape discards pending prompts back to the seed, Ctrl/Cmd+Z undoes the last prompt, and R resets prompts to the selected organ's seed. In point mode left click is positive, right click or Alt-click is negative, and dragging submits a current-slice box.
+- With the feature disabled, the blueprint is not registered and case loading stays on its existing path.
+- Verify route gating, coordinate mapping, no-overwrite merges, and shrink-on-reaccept with tests; retain existing backend/frontend checks and TypeScript check.
+- Out of scope: local 3D mesh manifests may fail when `MESH_PATH` points to the unrelated Linux default. Do not modify that behavior here.
+- Before deployment, a human must configure the private GPU host and API key, confirm the model-weight license, and run `scripts/nninteractive_smoke_test.py` against the real service.
